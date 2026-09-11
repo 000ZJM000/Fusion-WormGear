@@ -297,7 +297,7 @@ class WormGearCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
 
         except Exception:
             ui = adsk.core.Application.get().userInterface
-            ui.messageBox(f"初始化界面失败:\n{traceback.format_exc()}")
+            ui.messageBox(f"初始化界面失败：\n{traceback.format_exc()}")
 
 
 class WormGearInputChangedHandler(adsk.core.InputChangedEventHandler):
@@ -495,20 +495,21 @@ class WormGearCommandExecuteHandler(adsk.core.CommandEventHandler):
             is_valid, v_errors, v_warnings = gear_math.validate()
             if not is_valid:
                 ui.messageBox(
-                    "参数校核未通过，已中止生成：\n\n"
+                    "参数校核未通过，已中止生成。\n\n"
                     + "\n".join(f"· {e}" for e in v_errors)
-                    + ("\n\n提示:\n" + "\n".join(f"· {w}" for w in v_warnings) if v_warnings else "")
+                    + ("\n\n提示：\n" + "\n".join(f"· {w}" for w in v_warnings) if v_warnings else "")
                 )
                 return
             if v_warnings:
                 ui.messageBox(
-                    "参数提示 (可继续生成)：\n\n" + "\n".join(f"· {w}" for w in v_warnings)
+                    "请注意以下提示（不影响本次生成）：\n\n"
+                    + "\n".join(f"· {w}" for w in v_warnings)
                 )
 
             # 获取当前设计环境
             design = adsk.fusion.Design.cast(app.activeProduct)
             if not design:
-                ui.messageBox("请在 Design 建模环境下运行此功能！")
+                ui.messageBox("请在 Design（设计）建模环境下运行本功能。")
                 return
 
             root_comp = design.rootComponent
@@ -650,19 +651,18 @@ class WormGearCommandExecuteHandler(adsk.core.CommandEventHandler):
                     ml_link = motion_links.add(ml_input)
                     ml_link.name = f"蜗轮蜗杆传动副_{params['ratio_i']:.1f}比1"
                 except Exception as e_joint:
-                    ui.messageBox(f"装配旋转副绑定提示:\n{traceback.format_exc()}")
+                    ui.messageBox(f"装配旋转副绑定提示：\n{traceback.format_exc()}")
 
                 ui.messageBox(
-                    f"蜗轮蜗杆装配体生成成功！\n\n"
-                    f"中心距 a: {params['center_distance_a']:.2f} mm\n"
-                    f"传动比 i: {params['ratio_i']:.1f}:1 ({z2}/{z1})\n"
-                    f"导程角 γ: {params['lead_angle_gamma_deg']:.2f}°\n"
-                    f"旋向: {'右旋' if direction == 'Right' else '左旋'}\n"
-                    f"自锁状态: {params['self_locking_status']}\n\n"
-                    f"已创建原生旋转副与运动链接：蜗杆自转 360°，蜗轮转 "
+                    f"蜗轮蜗杆装配体生成成功。\n\n"
+                    f"中心距 a：{params['center_distance_a']:.2f} mm\n"
+                    f"传动比 i：{params['ratio_i']:.2f} : 1　（z2 / z1 = {z2} / {z1}）\n"
+                    f"导程角 γ：{params['lead_angle_gamma_deg']:.2f}°\n"
+                    f"旋向：{'右旋' if direction == 'Right' else '左旋'}\n"
+                    f"自锁状态：{params['self_locking_status']}\n\n"
+                    f"已建立旋转副与运动链接：蜗杆转 360° 时，蜗轮转 "
                     f"{360.0 * z1 / float(z2):.4f}°。\n"
-                    f"可直接拖拽或右键运动链接播放动画。\n"
-                    f"若观察到的转向与实际不符，请告知旋向与转向，便于校准符号。"
+                    f"拖拽蜗杆，或在浏览器中右键运动链接即可播放动画。"
                 )
 
             elif "仅蜗杆" in target_mode:
@@ -671,10 +671,11 @@ class WormGearCommandExecuteHandler(adsk.core.CommandEventHandler):
                 worm_comp.name = f"蜗杆_m{m_mm}_z{z1}"
                 w_builder.build_worm(worm_comp, params)
                 ui.messageBox(
-                    f"蜗杆生成成功！\n\n"
-                    f"顶圆直径 da1: {params['worm_tip_diameter_da1']:.2f} mm\n"
-                    f"螺纹长度 b1: {params['worm_length_b1']:.1f} mm\n"
-                    f"导程角 γ: {params['lead_angle_gamma_deg']:.2f}°"
+                    f"蜗杆生成成功。\n\n"
+                    f"顶圆直径 da1：{params['worm_tip_diameter_da1']:.2f} mm\n"
+                    f"螺纹长度 b1：{params['worm_length_b1']:.2f} mm\n"
+                    f"导程角 γ：{params['lead_angle_gamma_deg']:.2f}°\n"
+                    f"旋向：{'右旋' if direction == 'Right' else '左旋'}"
                 )
 
             else:
@@ -683,14 +684,14 @@ class WormGearCommandExecuteHandler(adsk.core.CommandEventHandler):
                 wheel_comp.name = f"蜗轮_m{m_mm}_z{z2}"
                 g_builder.build_worm_wheel(wheel_comp, params, quality)
                 ui.messageBox(
-                    f"蜗轮生成成功！\n\n"
-                    f"喉圆直径 da2: {params['wheel_throat_diameter_da2']:.2f} mm\n"
-                    f"齿宽 b2: {params['wheel_face_width_b2']:.1f} mm\n"
-                    f"齿数 z2: {z2}"
+                    f"蜗轮生成成功。\n\n"
+                    f"喉圆直径 da2：{params['wheel_throat_diameter_da2']:.2f} mm\n"
+                    f"齿宽 b2：{params['wheel_face_width_b2']:.2f} mm\n"
+                    f"齿数 z2：{z2}"
                 )
 
         except Exception:
-            ui.messageBox(f"生成过程出错:\n{traceback.format_exc()}")
+            ui.messageBox(f"生成过程出错：\n{traceback.format_exc()}")
 
 
 class WormGearCommandDestroyHandler(adsk.core.CommandEventHandler):
@@ -863,7 +864,7 @@ def run(context):
 
     except Exception:
         if ui:
-            ui.messageBox(f"启动插件失败:\n{traceback.format_exc()}")
+            ui.messageBox(f"启动插件失败：\n{traceback.format_exc()}")
 
 
 def stop(context):
@@ -902,4 +903,4 @@ def stop(context):
 
     except Exception:
         if ui:
-            ui.messageBox(f"卸载插件失败:\n{traceback.format_exc()}")
+            ui.messageBox(f"卸载插件失败：\n{traceback.format_exc()}")
