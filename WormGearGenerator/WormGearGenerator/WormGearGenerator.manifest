@@ -1,0 +1,13 @@
+{
+	"autodeskProduct":	"Fusion",
+	"type":	"addin",
+	"id":	"9a71f0b2-3e28-4993-9c88-e24c5b1f0987",
+	"author":	"Jeremy",
+	"description":	{
+		"":	"参数化蜗轮蜗杆生成器 / Parametric Worm & Worm Gear Generator (GB/T 10085-2018)"
+	},
+	"version":	"1.1.0",
+	"runOnStartup":	false,
+	"supportedOS":	"windows|mac",
+	"editEnabled":	true
+}
