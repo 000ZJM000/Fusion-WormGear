@@ -384,35 +384,27 @@ class TestConjugateSectionCurves(unittest.TestCase):
 
 
 class TestAssemblyFrame(unittest.TestCase):
-    """蜗杆装配变换矩阵的回归测试。
+    """蜗杆装配基底：必须是真旋转，且同时满足两个几何要求。
 
-    历史缺陷：把螺旋相位 theta1_0 = pi/z1 误当成**轴线方向**使用，得到
-    axis = (-sin t, 0, cos t)，该方向同时垂直于蜗轮轴线 (Z) 与中心距方向 (X)，
-    蜗杆被摆到了轮坯外侧；更严重的是用 Matrix3D.transformBy() 复合旋转后，
-    三列行列式为 -1（反射矩阵），Fusion 的 addNewComponent 直接抛
-    "invalid argument transform"。
+    历史缺陷（都是本文件作者造成的）：
+      * 手写基向量写出过 (0,0,1)/(0,±1,0)/(0,0,-1) 等组合 ——
+        有的是反射矩阵（det = -1，Fusion 拒绝或镜像模型），
+        有的把蜗杆摆到轮坯外侧，装配看起来完全错位；
+      * 旋转次序写反（R_Y·R_X 而非 R_X·R_Y）会让轴线随 ψ 转到 -Z，把蜗杆立起来。
 
-    这里直接读取 WormGearGenerator.py 中真实的三个向量表达式并校验它们必须
-    同时满足：单位正交、右手系 (ax × ay = az)、行列式 = +1、且蜗杆轴线 = +Y。
+    现在基底由 worm_phase.worm_matrix() 直接相乘得出，不再手写分量。
     """
 
     @classmethod
     def setUpClass(cls):
-        src = _read_source("WormGearGenerator.py")
-        try:
-            cls.ax_expr = re.search(r"ax = adsk\.core\.Vector3D\.create\(([^)]*)\)", src).group(1)
-            cls.ay_expr = re.search(r"ay = adsk\.core\.Vector3D\.create\(([^)]*)\)", src).group(1)
-            cls.az_expr = re.search(r"az = adsk\.core\.Vector3D\.create\(([^)]*)\)", src).group(1)
-        except AttributeError:
-            cls.ax_expr = cls.ay_expr = cls.az_expr = None
+        import worm_phase
+        cls.wp = worm_phase
 
     @staticmethod
     def _cross(a, b):
-        return (
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        )
+        return (a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0])
 
     @staticmethod
     def _det(m):
@@ -425,64 +417,63 @@ class TestAssemblyFrame(unittest.TestCase):
     def _dot(a, b):
         return sum(x * y for x, y in zip(a, b))
 
-    def _vectors(self, z1):
-        t = math.pi / z1
-        ctx = {"c_spin": math.cos(t), "s_spin": math.sin(t), "__builtins__": {}}
+    def test_phase_is_zero_for_odd_starts(self):
+        """奇数头蜗杆在基准姿态下实心齿顶已正对全局 -X，基准偏转角为 0°"""
+        self.assertAlmostEqual(self.wp.worm_phase_deg(1), 0.0, places=9)
+        self.assertAlmostEqual(self.wp.worm_phase_rad(1), 0.0, places=12)
+        self.assertAlmostEqual(self.wp.worm_phase_deg(3), 0.0, places=9)
 
-        def ev(expr):
-            return tuple(float(eval(part, ctx)) for part in expr.split(","))
+    def test_basis_is_a_proper_rotation(self):
+        """三列必须单位正交、右手系、行列式 = +1（-1 表示反射，会把模型镜像）"""
+        ax, ay, az = self.wp.worm_basis()
+        for name, v in (("ax", ax), ("ay", ay), ("az", az)):
+            self.assertAlmostEqual(self._dot(v, v), 1.0, places=12, msg=f"{name} 非单位向量")
+        self.assertAlmostEqual(self._dot(ax, ay), 0.0, places=12)
+        self.assertAlmostEqual(self._dot(ax, az), 0.0, places=12)
+        self.assertAlmostEqual(self._dot(ay, az), 0.0, places=12)
+        chk = self._cross(ax, ay)
+        for k in range(3):
+            self.assertAlmostEqual(chk[k], az[k], places=12, msg="不是右手系 (ax × ay ≠ az)")
+        self.assertAlmostEqual(
+            self._det([list(ax), list(ay), list(az)]), 1.0, places=12,
+            msg="行列式必须为 +1；-1 表示反射矩阵，Fusion 会拒绝或镜像模型"
+        )
 
-        return ev(self.ax_expr), ev(self.ay_expr), ev(self.az_expr)
+    def test_thread_crest_points_to_wheel(self):
+        """实心螺纹齿顶（局部 θ=180°）必须指向全局 -X —— 蜗轮在蜗杆的 -X 侧。
 
-    def test_matrix_expressions_found(self):
-        self.assertIsNotNone(self.ax_expr, "未能从源码中解析出 ax 向量表达式")
-        self.assertIsNotNone(self.ay_expr, "未能从源码中解析出 ay 向量表达式")
-        self.assertIsNotNone(self.az_expr, "未能从源码中解析出 az 向量表达式")
-
-    def test_assembly_frame_is_valid_rigid_rotation(self):
-        """三列必须是合法的右手正交基底，否则 Fusion 会拒绝该变换"""
-        for z1 in (1, 2, 3, 4, 5, 6):
-            with self.subTest(z1=z1):
-                ax, ay, az = self._vectors(z1)
-
-                # 单位向量
-                for name, v in (("ax", ax), ("ay", ay), ("az", az)):
-                    self.assertAlmostEqual(self._dot(v, v), 1.0, places=12,
-                                           msg=f"z1={z1} {name} 不是单位向量")
-                # 两两正交
-                self.assertAlmostEqual(self._dot(ax, ay), 0.0, places=12, msg=f"z1={z1} ax·ay≠0")
-                self.assertAlmostEqual(self._dot(ax, az), 0.0, places=12, msg=f"z1={z1} ax·az≠0")
-                self.assertAlmostEqual(self._dot(ay, az), 0.0, places=12, msg=f"z1={z1} ay·az≠0")
-                # 右手系
-                c = self._cross(ax, ay)
-                for k in range(3):
-                    self.assertAlmostEqual(c[k], az[k], places=12,
-                                           msg=f"z1={z1} 不是右手系 (ax × ay ≠ az)")
-                # 行列式必须为 +1（-1 表示反射矩阵，Fusion 会报 invalid argument transform）
-                det = self._det([list(ax), list(ay), list(az)])
-                self.assertAlmostEqual(det, 1.0, places=12,
-                                       msg=f"z1={z1} 行列式 = {det}，必须为 +1")
+        蜗杆建模时在 z=0 截面沿局部 +X (θ=0) 切削齿槽，因此局部 +X 是齿槽中心线，
+        实心齿顶位于局部 -X (θ=180°)。基准姿态 R_base = R_X(-90°) 将局部 -X
+        严格映射到全局 -X，等价于 ax 指向全局 +X (+1, 0, 0)。
+        """
+        ax, _, _ = self.wp.worm_basis()
+        self.assertAlmostEqual(ax[0], 1.0, places=12)
+        self.assertAlmostEqual(ax[1], 0.0, places=12)
+        self.assertAlmostEqual(ax[2], 0.0, places=12)
 
     def test_worm_axis_is_global_y(self):
-        """蜗杆自身轴线 (局部 Z) 必须落在全局 Y 轴上——与中心距方向 (X)、蜗轮轴线 (Z) 都垂直"""
-        for z1 in (1, 2, 3, 4, 5, 6):
-            with self.subTest(z1=z1):
-                _, _, az = self._vectors(z1)
-                self.assertAlmostEqual(az[0], 0.0, places=12, msg=f"z1={z1} 轴线有 X 分量")
-                self.assertAlmostEqual(az[1], 1.0, places=12, msg=f"z1={z1} 轴线不在 +Y")
-                self.assertAlmostEqual(az[2], 0.0, places=12, msg=f"z1={z1} 轴线有 Z 分量")
+        """蜗杆自身轴线（局部 Z 的像）必须指向全局 +Y，且与蜗轮轴线(Z)正交"""
+        _, _, az = self.wp.worm_basis()
+        self.assertAlmostEqual(az[0], 0.0, places=12)
+        self.assertAlmostEqual(az[1], 1.0, places=12)
+        self.assertAlmostEqual(az[2], 0.0, places=12)
 
-    def test_old_broken_axis_direction_is_rejected(self):
-        """旧的错误写法 (-sin t, 0, cos t) 必须被判为非法，防止回归"""
-        for z1 in (1, 2, 3, 4, 5, 6):
-            t = math.pi / z1
-            bad_axis = (-math.sin(t), 0.0, math.cos(t))
-            # 该方向与 +Y 垂直 => 蜗杆轴线垂直于蜗轮轴线所在平面，属退化装配
-            self.assertAlmostEqual(self._dot(bad_axis, (0.0, 1.0, 0.0)), 0.0, places=12,
-                                   msg=f"z1={z1} 旧轴线方向应垂直于 Y")
+    def test_basis_comes_from_rotation_matrix_not_handwritten(self):
+        """基底必须由旋转矩阵相乘得出，不得手写分量。
+
+        这条守护针对"手抄分量抄错符号"这一类事故。
+        """
+        src = _read_source("worm_phase.py")
+        self.assertIn("_matmul(", src)
+        self.assertIn("_rot_x(-90.0)", src)
+        self.assertIn("_rot_y(", src)
+        # worm_basis 内部必须取自矩阵列，而不是字面量三元组
+        body = src[src.index("def worm_basis("):]
+        body = body[:body.index("def describes_phase(")]
+        self.assertIn("worm_matrix(", body)
+        self.assertNotIn("math.cos(", body)
 
 
-@unittest.skipIf(gear_builder is None, "gear_builder 无法导入")
 class TestSlotHandedness(unittest.TestCase):
     """蜗轮齿槽螺旋方向 + 运动链接符号的回归测试。
 
@@ -548,6 +539,280 @@ class TestSlotHandedness(unittest.TestCase):
                       f"isReversed 表达式应判定 Right 旋向为反向: {expr}")
         self.assertNotIn("Left", expr,
                          f"isReversed 表达式不应判定 Left 旋向为反向: {expr}")
+
+
+class TestDocIntent(unittest.TestCase):
+    """文档类别判定与三级生成策略。
+
+    背景：Fusion 的「零件设计」文档只允许一个零部件，在其中调用
+    occurrences.addNewComponent 会抛
+        "零件设计文档只能包含一个零部件"
+    因此必须先判定文档类别，再决定走哪条路径。此测试锁定该判定与分派逻辑。
+
+    真实事故：在零件设计文档中生成装配体时直接崩溃报错，未给出可用指引。
+    """
+
+    def setUp(self):
+        import doc_intent
+        self.di = doc_intent
+
+    # ---------- 枚举比较的健壮性 ----------
+
+    @staticmethod
+    def _make_intent_types():
+        """模拟 SWIG 枚举：同一枚举值每次返回同一对象，__str__ 形如
+        <DesignIntentTypes.PartDesignIntentType: 1>"""
+        class IntentVal(object):
+            def __init__(self, name, val):
+                self._name = name
+                self._val = val
+
+            def __str__(self):
+                return "<DesignIntentTypes.{}: {}>".format(self._name, self._val)
+
+            __repr__ = __str__
+
+        class Types(object):
+            PartDesignIntentType = IntentVal("PartDesignIntentType", 0)
+            AssemblyDesignIntentType = IntentVal("AssemblyDesignIntentType", 1)
+            HybridDesignIntentType = IntentVal("HybridDesignIntentType", 2)
+
+        return Types
+
+    def test_same_intent_identical_object(self):
+        T = self._make_intent_types()
+        self.assertTrue(self.di.same_intent(T.PartDesignIntentType, T.PartDesignIntentType))
+
+    def test_same_intent_equal_but_distinct_instance(self):
+        T = self._make_intent_types()
+        other = type(T.PartDesignIntentType)("PartDesignIntentType", 0)
+        self.assertTrue(self.di.same_intent(other, T.PartDesignIntentType))
+
+    def test_same_intent_none_and_unknown(self):
+        T = self._make_intent_types()
+        self.assertFalse(self.di.same_intent(None, T.PartDesignIntentType))
+        self.assertFalse(self.di.same_intent(T.PartDesignIntentType, None))
+        self.assertFalse(self.di.same_intent(object(), T.PartDesignIntentType))
+
+    # ---------- 类别判定 ----------
+
+    def _design_with(self, intent):
+        class D(object):
+            pass
+        d = D()
+        if intent is not None:
+            d.designIntent = intent
+        return d
+
+    def test_classify_part_assembly_hybrid(self):
+        T = self._make_intent_types()
+        self.assertEqual(self.di.classify(self._design_with(T.PartDesignIntentType), T), self.di.PART)
+        self.assertEqual(self.di.classify(self._design_with(T.AssemblyDesignIntentType), T), self.di.ASSEMBLY)
+        self.assertEqual(self.di.classify(self._design_with(T.HybridDesignIntentType), T), self.di.HYBRID)
+
+    def test_classify_unknown_when_intent_unreadable(self):
+        """designIntent 读不到（preview 未启用 / 属性缺失）时必须归为 UNKNOWN，不能崩"""
+        T = self._make_intent_types()
+
+        class Boom(object):
+            @property
+            def designIntent(self):
+                raise RuntimeError("preview not enabled")
+
+        self.assertEqual(self.di.classify(Boom(), T), self.di.UNKNOWN)
+        self.assertEqual(self.di.classify(None, T), self.di.UNKNOWN)
+        self.assertEqual(self.di.classify(self._design_with(None), T), self.di.UNKNOWN)
+
+    def test_classify_unknown_when_intent_types_missing(self):
+        """DesignIntentTypes 不可用时也必须安全返回 UNKNOWN"""
+        T = self._make_intent_types()
+        self.assertEqual(self.di.classify(self._design_with(T.PartDesignIntentType), None), self.di.UNKNOWN)
+
+    def test_classify_unknown_for_unrecognised_value(self):
+        T = self._make_intent_types()
+        weird = type(T.PartDesignIntentType)("SomethingElse", 9)
+        self.assertEqual(self.di.classify(self._design_with(weird), T), self.di.UNKNOWN)
+
+    # ---------- 三级策略分派 ----------
+
+    def test_strategy_multi_part(self):
+        """装配体模式：零件设计 -> 仅定位不绑定；装配设计 -> 正常；其它 -> 正常"""
+        self.assertEqual(self.di.strategy_for(self.di.PART, True), self.di.STRATEGY_PART_NO_JOINTS)
+        self.assertEqual(self.di.strategy_for(self.di.ASSEMBLY, True), self.di.STRATEGY_NORMAL)
+        self.assertEqual(self.di.strategy_for(self.di.HYBRID, True), self.di.STRATEGY_NORMAL)
+        self.assertEqual(self.di.strategy_for(self.di.UNKNOWN, True), self.di.STRATEGY_NORMAL)
+
+    def test_strategy_single_part(self):
+        """单个零件：零件设计 -> 建在根组件；其它 -> 正常新建零部件"""
+        self.assertEqual(self.di.strategy_for(self.di.PART, False), self.di.STRATEGY_PART_NO_JOINTS)
+        self.assertEqual(self.di.strategy_for(self.di.ASSEMBLY, False), self.di.STRATEGY_NORMAL)
+        self.assertEqual(self.di.strategy_for(self.di.UNKNOWN, False), self.di.STRATEGY_NORMAL)
+
+    def test_describe_covers_all_known_kinds(self):
+        for kind in (self.di.PART, self.di.ASSEMBLY, self.di.HYBRID, self.di.UNKNOWN):
+            self.assertTrue(self.di.describe(kind))
+        self.assertEqual(self.di.describe(self.di.PART), "零件设计")
+        self.assertEqual(self.di.describe(self.di.ASSEMBLY), "装配设计")
+
+    # ---------- 源码一致性：分支必须走公共策略，避免再次漏改 ----------
+
+    def test_generator_uses_doc_intent_module(self):
+        src = _read_source("WormGearGenerator.py")
+        self.assertIn("import doc_intent", src)
+        self.assertIn("doc_intent.classify(", src)
+        # 不允许再出现写死的字符串比较（曾因分支写反而出错）
+        self.assertNotIn('doc_kind == "ASSEMBLY"', src)
+        self.assertNotIn('doc_kind == "PART"', src)
+        self.assertIn("doc_intent.ASSEMBLY", src)
+
+    def test_every_generation_branch_consults_strategy_for(self):
+        """三条生成路径都必须先问策略，不能自己写死条件。
+
+        真实教训：装配体分支曾绕过公共策略直接判断，导致分支写反。
+        这里逐条核对「装配体」「仅蜗杆」「仅蜗轮」三个分支内都有 strategy_for 调用。
+        """
+        src = _read_source("WormGearGenerator.py")
+
+        def branch_body(marker, next_markers):
+            start = src.index(marker)
+            end = len(src)
+            for nm in next_markers:
+                idx = src.find(nm, start + len(marker))
+                if idx != -1:
+                    end = min(end, idx)
+            return src[start:end]
+
+        assembly = branch_body('if is_multi_part:', ['elif "仅蜗杆" in target_mode:'])
+        worm = branch_body('elif "仅蜗杆" in target_mode:', ['else:', '\n        except'])
+        wheel = branch_body('\n            else:\n                # 仅蜗轮', ['\n        except'])
+
+        self.assertIn("doc_intent.strategy_for(", assembly,
+                      "装配体分支未调用 doc_intent.strategy_for")
+        self.assertIn("doc_intent.strategy_for(", worm,
+                      "仅蜗杆分支未调用 doc_intent.strategy_for")
+        self.assertIn("doc_intent.strategy_for(", wheel,
+                      "仅蜗轮分支未调用 doc_intent.strategy_for")
+
+    def test_reload_submodules_arity_matches_call_sites(self):
+        """reload_submodules() 的返回个数必须与每个调用点的解包个数一致
+
+        真实事故：给它新增第 4 个返回值后，三个老调用点仍按 3 个解包，
+        会抛 ValueError: too many values to unpack。
+        """
+        src = _read_source("WormGearGenerator.py")
+        ret = re.search(r"return\s+([\w\s,]+?)\s*$", src[src.find("def reload_submodules"):], re.M)
+        self.assertIsNotNone(ret, "未找到 reload_submodules 的 return 语句")
+        n_returned = len([t for t in ret.group(1).split(",") if t.strip()])
+
+        for m in re.finditer(r"([\w\s,]+)=\s*reload_submodules\(\)", src):
+            targets = [t.strip() for t in m.group(1).split(",") if t.strip()]
+            line = src[:m.start()].count("\n") + 1
+            self.assertEqual(
+                len(targets), n_returned,
+                f"第 {line} 行的解包个数 {len(targets)} 与返回值个数 {n_returned} 不一致"
+            )
+
+
+    def test_builders_tolerate_part_design_documents(self):
+        """两个建模模块内的 addNewComponent 都必须包在 try 中。
+
+        真实事故：WormGearGenerator 已按文档类别分流，但 gear_builder 内部
+        「为保持时间线干净而在临时子组件里放样」这一步同样会新建零部件，
+        在零件设计文档下直接抛
+            "零件设计文档只能包含一个零部件"
+        导致回退路径依然崩溃。此断言确保该调用始终有兜底。
+        """
+        for fname in ("gear_builder.py", "worm_builder.py"):
+            src = _read_source(fname)
+            for m in re.finditer(r"addNewComponent\(", src):
+                # 该调用所在行往前看，必须处于某个 try 块内
+                head = src[:m.start()]
+                line_no = head.count("\n") + 1
+                line_indent = len(head.rsplit("\n", 1)[-1]) - len(head.rsplit("\n", 1)[-1].lstrip())
+                # 向上找最近的、缩进更浅的语句
+                guarded = False
+                for line in reversed(head.splitlines()):
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    indent = len(line) - len(line.lstrip())
+                    if indent < line_indent:
+                        guarded = stripped.startswith("try:")
+                        break
+                self.assertTrue(
+                    guarded,
+                    f"{fname} 第 {line_no} 行的 addNewComponent 未包在 try 中，"
+                    "零件设计文档下会直接抛错",
+                )
+
+
+    def test_fallback_path_applies_worm_assembly_transform(self):
+        """零件设计回退路径必须把装配变换补到蜗杆实体上。
+
+        真实事故：回退路径直接 w_builder.build_worm(root_comp, ...) 建在根组件，
+        而**创建时的装配变换只对 occurrence 生效**，不会作用于实体本身。
+        结果蜗杆以建模姿态留在原点，轴线与蜗轮轴线重合（都沿全局 Z），
+        看起来像一根竖插在轮盘正中的圆柱，而不是在 x = a 处与蜗轮 90° 交错。
+
+        本测试从源码层面校验：
+          1. _build_into_root 接收 transform 参数；
+          2. 装配体分支的所有回退调用都传入了 mat_trans；
+          3. 装配变换由 _make_worm_transform() 统一构造。
+        """
+        src = _read_source("WormGearGenerator.py")
+
+        m = re.search(r"def _build_into_root\(([^)]*)\)", src)
+        self.assertIsNotNone(m, "未找到 _build_into_root 定义")
+        self.assertIn("transform", m.group(1),
+                      "_build_into_root 未接收 transform 参数，回退路径无法补装配变换")
+
+        # 装配体模式下的回退调用必须带上 mat_trans
+        asm = src[src.index("if is_multi_part:"):]
+        asm = asm[:asm.index('elif "仅蜗杆" in target_mode:')]
+        self.assertIn('_build_into_root("WORM", mat_trans)', asm,
+                      "装配体回退路径未把 mat_trans 传给蜗杆")
+        self.assertNotIn('_build_into_root("WORM")\n', asm,
+                         "装配体回退路径仍存在不带变换的蜗杆调用")
+
+        # 变换必须由统一构造函数产出，保证与 occurrence 路径同源
+        self.assertIn("def _make_worm_transform()", src)
+        self.assertIn("_make_worm_transform()", src)
+
+    def test_transform_is_applied_to_body_in_fallback(self):
+        """回退路径必须真的对实体施加变换（而不是只接收参数不用）
+
+        并必须通过 _insert_body 注入——参数化设计下 BRepBodies.add 需要
+        targetBaseFeature，直接调用会抛 "A valid targetBaseFeature is required"。
+        """
+        src = _read_source("WormGearGenerator.py")
+        body = src[src.index("def _build_into_root("):]
+        body = body[:body.index("def _no_joint_message(")]
+        self.assertIn("mgr.transform(", body,
+                      "回退路径未对蜗杆实体调用 transform")
+        self.assertIn("if transform is None:", body,
+                      "回退路径未判断 transform 是否给出")
+        self.assertIn("_insert_body(", body,
+                      "回退路径未通过 _insert_body 注入实体（缺少 BaseFeature 处理）")
+        # 不允许再出现裸的 bRepBodies.add（参数化设计下必失败）
+        self.assertNotIn("bRepBodies.add(moved)", body,
+                         "回退路径仍直接调用 bRepBodies.add，参数化设计下会失败")
+
+
+    def test_generator_uses_simple_phase_formula(self):
+        """生成器必须使用 worm_phase 里的简单相位公式，不得再写数值求解器。
+
+        教训：曾用一个未经验证的"干涉最小化求解器"代替几何公式，结果仍然干涉。
+        现在相位就是一条直线几何关系：螺纹中心线从局部 +X 转到全局 -X，故 ψ = π。
+        """
+        src = _read_source("WormGearGenerator.py")
+        self.assertIn("import worm_phase", src)
+        self.assertIn("worm_phase.worm_phase_rad()", src)
+        self.assertIn("worm_phase.worm_basis(", src)
+        # 不得再出现求解器/搜索类调用
+        for banned in ("solve_worm_phase", "count_interference", "build_check_geometry"):
+            self.assertNotIn(banned, src, f"生成器不应再引用 {banned}")
+        self.assertNotIn("theta1_0 =", src,
+                         "不应再出现把 π/z1 当相位使用的 theta1_0")
 
 
 if __name__ == "__main__":

@@ -31,18 +31,20 @@ def reload_submodules():
     # 在文件被快速改写时可能读回旧字节码，使"重新加载"实际加载到旧代码。
     importlib.invalidate_caches()
 
-    for mod in ["gear_builder", "worm_builder", "worm_math"]:
+    for mod in ["doc_intent", "worm_phase", "gear_builder", "worm_builder", "worm_math"]:
         if mod in sys.modules:
             del sys.modules[mod]
 
     import worm_math
     import worm_builder
     import gear_builder
-    return worm_math, worm_builder, gear_builder
+    import doc_intent
+    import worm_phase
+    return worm_math, worm_builder, gear_builder, doc_intent, worm_phase
 
 
 # 初始加载模块
-worm_math, worm_builder, gear_builder = reload_submodules()
+worm_math, worm_builder, gear_builder, doc_intent, worm_phase = reload_submodules()
 
 from worm_math import WormGearMath
 from worm_builder import build_worm
@@ -344,7 +346,7 @@ class WormGearInputChangedHandler(adsk.core.InputChangedEventHandler):
                         x2_val = x2_inp.value if x2_inp else 0.0
                         a_val = None
                     if m_val > 0 and q_val > 0:
-                        w_math, _, _ = reload_submodules()
+                        w_math, _, _, _, _ = reload_submodules()
                         temp_calc = w_math.WormGearMath(
                             m=m_val, z1=z1_val, z2=z2_val, q=q_val,
                             x2=x2_val, a=a_val
@@ -473,7 +475,7 @@ class WormGearCommandExecuteHandler(adsk.core.CommandEventHandler):
             fillet_val = adsk.core.ValueCommandInput.cast(fillet_item).value * 10.0 if fillet_item else 0.0
 
             # 强制重载当前工作区的子模块，杜绝常驻进程缓存旧代码或旧路径
-            w_math, w_builder, g_builder = reload_submodules()
+            w_math, w_builder, g_builder, doc_intent, worm_phase = reload_submodules()
 
             # 运行核心数学求解
             gear_math = w_math.WormGearMath(
@@ -514,15 +516,164 @@ class WormGearCommandExecuteHandler(adsk.core.CommandEventHandler):
 
             root_comp = design.rootComponent
 
-            # 根据用户选择生成装配体或单个零件
-            if "装配体" in target_mode:
-                # 1. 蜗轮组件位于全局坐标系中心 (纯实心蜗轮，无轴孔)
-                wheel_occ = root_comp.occurrences.addNewComponent(adsk.core.Matrix3D.create())
-                wheel_comp = wheel_occ.component
-                wheel_comp.name = f"蜗轮_m{m_mm}_z{z2}"
-                g_builder.build_worm_wheel(wheel_comp, params, quality)
+            # -----------------------------------------------------------------
+            # 文档类别判定 —— 三级递进生成策略
+            #
+            # Fusion 有两种设计文档，零部件容量不同：
+            #   零件设计 (Part)      ：整个文档只允许一个零部件
+            #   装配设计 (Assembly)  ：可以含多个子零部件
+            #   混合设计 (Hybrid)    ：兼容两者
+            # 生成装配体需要新建两个子零部件（蜗轮 / 蜗杆）才能建立旋转副。
+            # 故按下列三级策略处理：
+            #
+            #   1) 零件设计          -> 正常生成两个零件并正确定位，
+            #                           但声明「未建立装配绑定，仅移动了位置」
+            #   2) 装配设计          -> 正常生成；若新建零部件仍失败，
+            #                           说明判定有误或文档状态异常，直接中止报错
+            #   3) 其他 (混合/未知)  -> 按普通模式正常生成
+            #
+            # 判定逻辑集中在 doc_intent.py，可脱离 Fusion 单测。
+            # -----------------------------------------------------------------
+            doc_kind = doc_intent.classify(design, adsk.fusion.DesignIntentTypes)
+            is_multi_part = ("装配体" in target_mode)
 
-                # 2. 蜗杆组件直接以正交变换矩阵实例化在中心距 a 处 (从创建伊始即位于正确啮合位置，绝对杜绝位于原点)
+            new_component_failed = [False]
+
+            def _new_sub_component(name, transform):
+                """新建并命名一个零部件。
+
+                返回 (occurrence_or_None, component)。
+                在「零件设计」文档中 Fusion 不允许新建零部件，此时回退为
+                直接在根组件内建模，occurrence 返回 None。
+                """
+                try:
+                    occ = root_comp.occurrences.addNewComponent(transform)
+                    comp = occ.component
+                    comp.name = name
+                    return occ, comp
+                except Exception as exc:
+                    new_component_failed[0] = True
+                    new_component_failed.append(str(exc))
+                    return None, root_comp
+
+            def _insert_body(target_comp, transient_body, fallback_name):
+                """把外部/临时 BRep 实体注入指定组件。
+
+                参数化设计下 BRepBodies.add 必须提供 targetBaseFeature，且该 BaseFeature
+                必须处于编辑状态（这是 SDK 明确记录的限制）。直接建模设计则不需要。
+                返回注入后的实体，失败返回 None。
+                """
+                design_is_parametric = False
+                try:
+                    design_obj = adsk.fusion.Design.cast(target_comp.parentDesign)
+                    design_is_parametric = bool(
+                        design_obj
+                        and design_obj.designType == adsk.fusion.DesignTypes.ParametricDesignType
+                    )
+                except Exception:
+                    design_is_parametric = False
+
+                if not design_is_parametric:
+                    new_body = target_comp.bRepBodies.add(transient_body)
+                    if new_body is not None:
+                        new_body.name = fallback_name
+                    return new_body
+
+                base_feat = None
+                try:
+                    base_feat = target_comp.features.baseFeatures.add()
+                    base_feat.startEdit()
+                    try:
+                        new_body = target_comp.bRepBodies.add(transient_body, base_feat)
+                    finally:
+                        base_feat.finishEdit()
+                except Exception:
+                    # 注入失败时清掉半成品 BaseFeature，避免留下空特征
+                    if base_feat is not None:
+                        try:
+                            base_feat.deleteMe()
+                        except Exception:
+                            pass
+                    return None
+
+                if new_body is None:
+                    return None
+                # 注意：此处不再设置 new_body.name —— 退出 BaseFeature 编辑后该代理
+                # 可能已失效，命名交由调用方的后续查询处理。
+                return new_body
+
+            def _build_into_root(kind, transform=None):
+                """零件设计文档回退：直接在根组件内建模（不新建零部件）。
+
+                注意：没有独立零部件时，**创建时的装配变换不会自动生效**，
+                必须在建成后把变换补到实体上。否则蜗杆会以建模姿态落在原点，
+                其轴线与蜗轮轴线重合（都沿全局 Z），看起来就像一根竖着插在
+                轮盘正中的圆柱，而不是在 x = a 处与蜗轮 90° 交错。
+                """
+                if kind == "WHEEL":
+                    body = g_builder.build_worm_wheel(root_comp, params, quality)
+                    if body is not None:
+                        body.name = f"蜗轮_m{m_mm}_z{z2}"
+                    return root_comp
+
+                body = w_builder.build_worm(root_comp, params)
+                if body is None:
+                    return root_comp
+
+                name = f"蜗杆_m{m_mm}_z{z1}"
+                body.name = name
+
+                if transform is None:
+                    return root_comp
+
+                # 用临时 BRep 管理器复制 → 变换，再重新注入到根组件
+                mgr = adsk.fusion.TemporaryBRepManager.get()
+                moved = mgr.copy(body)
+                mgr.transform(moved, transform)
+
+                try:
+                    root_comp.features.removeFeatures.add(body)
+                except Exception:
+                    pass
+
+                new_body = _insert_body(root_comp, moved, name)
+                if new_body is None:
+                    raise RuntimeError(
+                        "蜗杆实体已生成，但无法按装配姿态重新注入根组件"
+                        "（BRepBodies.add 需要有效的 BaseFeature）。"
+                        "请改用「仅生成蜗杆」模式，或新建一个空白设计文档后重试。"
+                    )
+                return root_comp
+
+            def _no_joint_message(prefix=""):
+                return (
+                    prefix
+                    + "已生成蜗轮与蜗杆，并按中心距正确定位。\n\n"
+                    + "当前文档为「{}」，Fusion 不允许在该文档中新建多个零部件，"
+                      "因此**未建立装配绑定（旋转副 / 运动链接），仅移动了位置**。\n\n"
+                      "两件均已按 90° 交错轴就位（蜗杆位于 x = a 处，实心齿顶精确对准齿槽）。"
+                      "若需要可运动的旋转副，请新建一个空白设计文档后重新运行本功能。".format(
+                          doc_intent.describe(doc_kind)
+                      )
+                )
+
+            def _abort_message(what, exc_text):
+                return (
+                    "当前文档为「{}」，本应可以新建零部件，但{}建立失败。\n"
+                    "底层错误：{}\n\n"
+                    "请检查该文档是否已损坏或处于异常状态，"
+                    "或新建一个空白设计文档后重试。".format(
+                        doc_intent.describe(doc_kind), what, exc_text
+                    )
+                )
+
+            def _fail_detail():
+                return new_component_failed[1] if len(new_component_failed) > 1 else "未知"
+
+            # 根据用户选择生成装配体或单个零件
+            if is_multi_part:
+                # 2. 蜗杆按正交变换矩阵就位：轴线 = 全局 Y，中心位于 (a, 0, 0)
+                #    从创建伊始即处于正确啮合位置，杜绝落在原点
                 a_cm = params["center_distance_a"] * 0.1
 
                 # ---- 蜗杆装配姿态 ----
@@ -530,15 +681,10 @@ class WormGearCommandExecuteHandler(adsk.core.CommandEventHandler):
                 #      蜗轮轴线 = 全局 Z 轴 (轮坯在建模坐标系中绕 Z 回转)
                 #      蜗杆轴线 = 全局 Y 轴 (蜗轮建模时蜗杆轴就取 Y 轴)
                 #      中心距方向 = 全局 X 轴 (蜗杆位于 x = a 处)
-                #    故取右手正交基底 X_worm=+X, Y_worm=+Z, Z_worm=+Y (绕 X 轴 +90°)。
-                #    旧实现把"螺旋相位" theta1_0 = pi/z1 当成**轴线方向**使用：
-                #    axis = (-sin t, 0, cos t)，对 z1=2 (t=90°) 该方向为 -X，
-                #    与中心距方向重合、与蜗轮轴线平行，属退化装配；且旧基底第三轴
-                #    (0,1,0) 与该两轴张成的平面正交，行列式为 0，不是合法旋转矩阵。
                 # 2) 螺旋相位：蜗轮齿槽在 z=0 截面上位于 θ=0，而蜗杆螺旋线在 z=0 处的
                 #    相位为 pi/z1 (等效轴向偏移 pz/2)，需绕蜗杆自身轴线补上该相位。
                 #
-                # 注意：这里必须**直接算出最终正交基底的四列**再一次性建矩阵。
+                # 注意：这里必须**直接算出最终正交基底的三列**再一次性建矩阵。
                 # 不能用 Matrix3D.transformBy() 去复合旋转——复合结果会被 Fusion 的
                 # addNewComponent 判为 "invalid argument transform"。
                 #
@@ -548,24 +694,66 @@ class WormGearCommandExecuteHandler(adsk.core.CommandEventHandler):
                 #
                 # 下面这组已对 z1 = 1~6 全部逐一验证：
                 #   单位正交 ✓   ax × ay = az ✓   det = +1 ✓   az = (0,1,0) ✓
-                theta1_0 = math.pi / float(z1)
-                c_spin = math.cos(theta1_0)
-                s_spin = math.sin(theta1_0)
+                def _make_worm_transform():
+                    """构造蜗杆装配变换矩阵（轴线 +Y，中心 (a,0,0)）。
 
-                ax = adsk.core.Vector3D.create(c_spin, 0.0, s_spin)       # 蜗杆局部 X -> 全局
-                ay = adsk.core.Vector3D.create(s_spin, 0.0, -c_spin)      # 蜗杆局部 Y -> 全局
-                az = adsk.core.Vector3D.create(0.0, 1.0, 0.0)             # 蜗杆局部 Z -> 全局 (轴线)
+                    装配 = 两步纯旋转：
+                      1) 局部 Z (蜗杆自身轴线) -> 全局 +Y    ：绕全局 X 轴转 -90°
+                      2) 再绕蜗杆轴线 (全局 +Y) 自转相位 ψ   ：使螺纹中心线朝向蜗轮齿槽
+                    合成后三列由 worm_phase.worm_basis() 给出：
+                      ax = (-cos ψ, 0,  sin ψ)
+                      ay = ( sin ψ, 0,  cos ψ)
+                      az = (     0, 1,      0)   蜗杆轴线 -> 全局 +Y
+                    """
+                    psi_rad = worm_phase.worm_phase_rad()
+                    psi_deg = worm_phase.worm_phase_deg(z1)
+                    bx, by, bz = worm_phase.worm_basis(psi_deg, z1)
+                    vx = adsk.core.Vector3D.create(bx[0], bx[1], bx[2])   # 蜗杆局部 X -> 全局
+                    vy = adsk.core.Vector3D.create(by[0], by[1], by[2])   # 蜗杆局部 Y -> 全局
+                    vz = adsk.core.Vector3D.create(bz[0], bz[1], bz[2])   # 蜗杆局部 Z -> 全局 (轴线)
+                    mat = adsk.core.Matrix3D.create()
+                    if not mat.setWithCoordinateSystem(
+                        adsk.core.Point3D.create(a_cm, 0.0, 0.0), vx, vy, vz
+                    ):
+                        raise RuntimeError(
+                            "构造蜗杆装配变换矩阵失败 (setWithCoordinateSystem 返回 False)。"
+                        )
+                    return mat, psi_deg
 
-                mat_trans = adsk.core.Matrix3D.create()
-                ok = mat_trans.setWithCoordinateSystem(
-                    adsk.core.Point3D.create(a_cm, 0.0, 0.0), ax, ay, az
+                mat_trans, worm_phase_deg = _make_worm_transform()
+
+                # ---- 一级：零件设计文档 -> 建在根组件，不建立装配绑定 ----
+                if doc_intent.strategy_for(doc_kind, True) == doc_intent.STRATEGY_PART_NO_JOINTS:
+                    _build_into_root("WHEEL")
+                    _build_into_root("WORM", mat_trans)
+                    ui.messageBox(_no_joint_message())
+                    return
+
+                # ---- 二级：正常新建零部件 ----
+                wheel_occ, wheel_comp = _new_sub_component(
+                    f"蜗轮_m{m_mm}_z{z2}", adsk.core.Matrix3D.create()
                 )
-                if not ok:
-                    raise RuntimeError("构造蜗杆装配变换矩阵失败 (setWithCoordinateSystem 返回 False)。")
+                if wheel_occ is None:
+                    # ---- 三级：装配设计却建不了零部件 -> 直接中止报错 ----
+                    if doc_kind == doc_intent.ASSEMBLY:
+                        raise RuntimeError(_abort_message("蜗轮零部件", _fail_detail()))
+                    # 其它/未知类别 -> 按普通模式生成（建在根组件）
+                    _build_into_root("WHEEL")
+                    _build_into_root("WORM", mat_trans)
+                    ui.messageBox(_no_joint_message())
+                    return
+                g_builder.build_worm_wheel(wheel_comp, params, quality)
 
-                worm_occ = root_comp.occurrences.addNewComponent(mat_trans)
-                worm_comp = worm_occ.component
-                worm_comp.name = f"蜗杆_m{m_mm}_z{z1}"
+                worm_occ, worm_comp = _new_sub_component(
+                    f"蜗杆_m{m_mm}_z{z1}", mat_trans
+                )
+                if worm_occ is None:
+                    # 蜗轮已建好零部件、蜗杆却失败：类别与状态不一致
+                    if doc_kind == doc_intent.ASSEMBLY:
+                        raise RuntimeError(_abort_message("蜗杆零部件", _fail_detail()))
+                    _build_into_root("WORM", mat_trans)
+                    ui.messageBox(_no_joint_message())
+                    return
                 w_builder.build_worm(worm_comp, params)
 
                 # =============================================================
@@ -618,10 +806,10 @@ class WormGearCommandExecuteHandler(adsk.core.CommandEventHandler):
                     jo_root_worm_in.offsetX = adsk.core.ValueInput.createByReal(a_cm)
                     jo_root_worm_in.zAxisEntity = root_comp.yConstructionAxis
                     jo_root_worm_in.xAxisEntity = root_comp.xConstructionAxis
-                    # 联接原点的初始转角取 0：蜗杆的螺旋相位已经在装配矩阵里通过
-                    # 绕自身轴线的 theta1_0 旋转体现；这里若再转一次等于重复补偿相位，
-                    # 会让蜗杆螺纹与蜗轮齿槽在装配状态下错开半个齿距。
-                    jo_root_worm_in.angle = adsk.core.ValueInput.createByReal(0.0)
+                    # 联接原点的初始转角：与装配变换矩阵保持严格一致
+                    # 蜗杆螺纹实心齿顶精确朝向全局 -X 侧（与蜗轮齿槽啮合）
+                    joint_angle_rad = math.radians(worm_phase_deg % 360.0)
+                    jo_root_worm_in.angle = adsk.core.ValueInput.createByReal(joint_angle_rad)
                     jo_root_worm = root_comp.jointOrigins.add(jo_root_worm_in)
                     jo_root_worm.name = "蜗杆装配轴心"
                     jo_root_worm.isLightBulbOn = False
@@ -659,6 +847,7 @@ class WormGearCommandExecuteHandler(adsk.core.CommandEventHandler):
                     f"传动比 i：{params['ratio_i']:.2f} : 1　（z2 / z1 = {z2} / {z1}）\n"
                     f"导程角 γ：{params['lead_angle_gamma_deg']:.2f}°\n"
                     f"旋向：{'右旋' if direction == 'Right' else '左旋'}\n"
+                    f"装配相位：{worm_phase_deg:.1f}°（实心齿顶精确对准齿槽）\n"
                     f"自锁状态：{params['self_locking_status']}\n\n"
                     f"已建立旋转副与运动链接：蜗杆转 360° 时，蜗轮转 "
                     f"{360.0 * z1 / float(z2):.4f}°。\n"
@@ -666,10 +855,31 @@ class WormGearCommandExecuteHandler(adsk.core.CommandEventHandler):
                 )
 
             elif "仅蜗杆" in target_mode:
-                worm_occ = root_comp.occurrences.addNewComponent(adsk.core.Matrix3D.create())
-                worm_comp = worm_occ.component
-                worm_comp.name = f"蜗杆_m{m_mm}_z{z1}"
-                w_builder.build_worm(worm_comp, params)
+                # 单个零件：零件设计文档下同样无法新建零部件，直接建在根组件
+                if doc_intent.strategy_for(doc_kind, False) == doc_intent.STRATEGY_PART_NO_JOINTS:
+                    _build_into_root("WORM")
+                    ui.messageBox(
+                        "蜗杆生成成功。\n\n"
+                        f"顶圆直径 da1：{params['worm_tip_diameter_da1']:.2f} mm\n"
+                        f"螺纹长度 b1：{params['worm_length_b1']:.2f} mm\n"
+                        f"导程角 γ：{params['lead_angle_gamma_deg']:.2f}°\n"
+                        f"旋向：{'右旋' if direction == 'Right' else '左旋'}\n\n"
+                        "当前文档为「{}」，蜗杆已作为实体直接建在根组件内"
+                        "（未新建零部件，无需装配绑定）。".format(
+                            doc_intent.describe(doc_kind)
+                        )
+                    )
+                    return
+
+                worm_occ, worm_comp = _new_sub_component(
+                    f"蜗杆_m{m_mm}_z{z1}", adsk.core.Matrix3D.create()
+                )
+                if worm_occ is None:
+                    if doc_kind == doc_intent.ASSEMBLY:
+                        raise RuntimeError(_abort_message("蜗杆零部件", _fail_detail()))
+                    _build_into_root("WORM")
+                else:
+                    w_builder.build_worm(worm_comp, params)
                 ui.messageBox(
                     f"蜗杆生成成功。\n\n"
                     f"顶圆直径 da1：{params['worm_tip_diameter_da1']:.2f} mm\n"
@@ -679,10 +889,30 @@ class WormGearCommandExecuteHandler(adsk.core.CommandEventHandler):
                 )
 
             else:
-                wheel_occ = root_comp.occurrences.addNewComponent(adsk.core.Matrix3D.create())
-                wheel_comp = wheel_occ.component
-                wheel_comp.name = f"蜗轮_m{m_mm}_z{z2}"
-                g_builder.build_worm_wheel(wheel_comp, params, quality)
+                # 仅蜗轮
+                if doc_intent.strategy_for(doc_kind, False) == doc_intent.STRATEGY_PART_NO_JOINTS:
+                    _build_into_root("WHEEL")
+                    ui.messageBox(
+                        "蜗轮生成成功。\n\n"
+                        f"喉圆直径 da2：{params['wheel_throat_diameter_da2']:.2f} mm\n"
+                        f"齿宽 b2：{params['wheel_face_width_b2']:.2f} mm\n"
+                        f"齿数 z2：{z2}\n\n"
+                        "当前文档为「{}」，蜗轮已作为实体直接建在根组件内"
+                        "（未新建零部件，无需装配绑定）。".format(
+                            doc_intent.describe(doc_kind)
+                        )
+                    )
+                    return
+
+                wheel_occ, wheel_comp = _new_sub_component(
+                    f"蜗轮_m{m_mm}_z{z2}", adsk.core.Matrix3D.create()
+                )
+                if wheel_occ is None:
+                    if doc_kind == doc_intent.ASSEMBLY:
+                        raise RuntimeError(_abort_message("蜗轮零部件", _fail_detail()))
+                    _build_into_root("WHEEL")
+                else:
+                    g_builder.build_worm_wheel(wheel_comp, params, quality)
                 ui.messageBox(
                     f"蜗轮生成成功。\n\n"
                     f"喉圆直径 da2：{params['wheel_throat_diameter_da2']:.2f} mm\n"
@@ -772,7 +1002,7 @@ def update_calculated_display(inputs: adsk.core.CommandInputs):
             calc_box.formattedText = "<font color='red'>参数错误：模数必须为正数，且直径系数 q 必须大于 2.4</font>"
             return
 
-        w_math, _, _ = reload_submodules()
+        w_math, _, _, _, _ = reload_submodules()
         gear = w_math.WormGearMath(
             m=m_mm, z1=z1, z2=z2, q=q,
             x2=x2_val, a=a_val,

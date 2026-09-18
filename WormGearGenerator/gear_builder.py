@@ -34,12 +34,12 @@ def _throat_arc_end(a: float, rg: float, re2: float, b2: float) -> float:
 
     喉母圆 (半径 rg，圆心位于蜗杆轴线上) 与两端半径 re2 的外圆柱面交于
     |zk| = sqrt(rg^2 - (a - re2)^2)。圆弧到此为止，之后由外圆柱面接管。
-    若该交点超过半个齿宽，则圆弧在端面之前就被截断，需按齿宽限制。
+    若该交点超过半个齿宽，则圆弧在端面之前就被截断，严格按半齿宽截断。
     这里与 build_worm_wheel 共用同一套计算，确保放样轮廓与轮坯外缘永不脱节。
     """
     term = rg * rg - (a - re2) ** 2
     z_int = math.sqrt(term) if term > 1e-9 else 0.0
-    return min(z_int, (b2 / 2.0) * 0.98)
+    return min(z_int, b2 / 2.0)
 
 
 def _blank_outer_radius(a: float, rg: float, re2: float, zk: float, z_arc_end: float) -> float:
@@ -48,16 +48,22 @@ def _blank_outer_radius(a: float, rg: float, re2: float, zk: float, z_arc_end: f
     与实际回转轮廓一致，且在喉部圆弧段内关于 |zk| 单调不减：
       - |zk| <= z_arc_end：喉部圆弧段，外半径 = a - sqrt(rg^2 - zk^2)
         （在圆弧真实交点处该值正好等于 re2；受齿宽截断时则小于 re2）
-      - |zk| >  z_arc_end：两端外圆柱段，外半径 = re2
-
-    旧实现用 |zk| < rg 作为分界（并在该处强行取 min 到 re2），与实际轮廓不符，
-    会在圆弧末端附近给出偏小的外半径，使放样轮廓越过轮坯真实边界。
+      - |zk| >  z_arc_end：
+        * 若 z_arc_end < z_int (窄轮情况，喉弧直接延伸到齿宽边缘)：
+          轮坯真实最大外半径为 z_arc_end 处的喉弧半径，不再跳变到外圆柱 re2；
+        * 若已到达外圆柱交点 z_int (宽轮情况)：两端外圆柱段，外半径 = re2
     """
     if rg > 1e-9 and abs(zk) <= z_arc_end:
         inner = rg * rg - zk * zk
         if inner > 0.0:
             return max(0.0, min(re2, a - math.sqrt(inner)))
+    term = rg * rg - (a - re2) ** 2
+    z_int = math.sqrt(term) if term > 1e-9 else 0.0
+    if z_arc_end < z_int - 1e-4:
+        inner_edge = max(0.0, rg * rg - z_arc_end * z_arc_end)
+        return max(0.0, min(re2, a - math.sqrt(inner_edge)))
     return re2
+
 
 
 def _build_geom(params: dict, scale: float = 0.1) -> dict:
@@ -329,41 +335,56 @@ def build_worm_wheel(
     # 喉母圆半径 rg = a - da2 / 2
     # z_arc_end 与 _compute_section_curves 共用同一个辅助函数：
     # 任何一侧被修改而另一侧忘记同步，都会导致齿槽放样轮廓越过轮坯真实外缘。
+    z_int_term = rg * rg - (a - re2) ** 2
+    z_int = math.sqrt(z_int_term) if z_int_term > 1e-9 else 0.0
     z_arc_end = _throat_arc_end(a, rg, re2, b2)
-    if (b2 / 2.0) - z_arc_end < 1e-4:
-        # 圆弧已经延伸到端面，无需倒斜角
-        z_arc_end = (b2 / 2.0)
+    is_narrow = (b2 / 2.0) <= z_int + 1e-4
     x_arc_end = a - math.sqrt(max(1e-6, rg ** 2 - z_arc_end ** 2))
-
-    # 在 3D 模型空间定义轮廓关键顶点 (全部位于 XZ 平面，Y = 0)
-    p_arc_low_m = adsk.core.Point3D.create(x_arc_end, 0.0, -z_arc_end)
-    p_arc_mid_m = adsk.core.Point3D.create(da2 / 2.0, 0.0, 0.0)
-    p_arc_top_m = adsk.core.Point3D.create(x_arc_end, 0.0, z_arc_end)
 
     # 蜗轮端面倒斜角尺寸 (默认单边为总高度 b2 的 5%)
     wheel_chamfer_c = params.get(
         "wheel_chamfer_c", 0.05 * params["wheel_face_width_b2"]
     ) * scale
-    dz_rim = (b2 / 2.0) - z_arc_end
-    c_eff = min(wheel_chamfer_c, dz_rim * 0.95, (b2 / 2.0) * 0.45) if dz_rim > 1e-4 else 0.0
-
-    has_chamfer = (c_eff > 1e-4)
-    if has_chamfer:
-        t_ch = ((b2 / 2.0) - c_eff - z_arc_end) / dz_rim
-        x_chamfer_rim = x_arc_end + t_ch * (re2 - x_arc_end)
-        z_chamfer_rim = (b2 / 2.0) - c_eff
-
-        p_chamfer_rim_top_m = adsk.core.Point3D.create(x_chamfer_rim, 0.0, z_chamfer_rim)
-        p_chamfer_face_top_m = adsk.core.Point3D.create(re2 - c_eff, 0.0, b2 / 2.0)
-
-        p_chamfer_face_low_m = adsk.core.Point3D.create(re2 - c_eff, 0.0, -b2 / 2.0)
-        p_chamfer_rim_low_m = adsk.core.Point3D.create(x_chamfer_rim, 0.0, -z_chamfer_rim)
-    else:
-        p_rim_top_m = adsk.core.Point3D.create(re2, 0.0, b2 / 2.0)
-        p_rim_low_m = adsk.core.Point3D.create(re2, 0.0, -b2 / 2.0)
 
     p_center_top_m = adsk.core.Point3D.create(0.0, 0.0, b2 / 2.0)
     p_center_low_m = adsk.core.Point3D.create(0.0, 0.0, -b2 / 2.0)
+
+    if is_narrow:
+        # 窄轮：整个齿宽都在喉部圆弧范围内，轮坯无外圆柱段 re2
+        c_eff = min(wheel_chamfer_c, (b2 / 2.0) * 0.45, (x_arc_end - da2 / 2.0) * 0.45) if wheel_chamfer_c > 1e-4 else 0.0
+        has_chamfer = (c_eff > 1e-4)
+
+        if has_chamfer:
+            z_ch_arc = (b2 / 2.0) - c_eff
+            x_ch_arc = a - math.sqrt(max(1e-6, rg ** 2 - z_ch_arc ** 2))
+            p_arc_low_m = adsk.core.Point3D.create(x_ch_arc, 0.0, -z_ch_arc)
+            p_arc_mid_m = adsk.core.Point3D.create(da2 / 2.0, 0.0, 0.0)
+            p_arc_top_m = adsk.core.Point3D.create(x_ch_arc, 0.0, z_ch_arc)
+
+            p_ch_face_top_m = adsk.core.Point3D.create(x_arc_end - c_eff, 0.0, b2 / 2.0)
+            p_ch_face_low_m = adsk.core.Point3D.create(x_arc_end - c_eff, 0.0, -b2 / 2.0)
+        else:
+            p_arc_low_m = adsk.core.Point3D.create(x_arc_end, 0.0, -b2 / 2.0)
+            p_arc_mid_m = adsk.core.Point3D.create(da2 / 2.0, 0.0, 0.0)
+            p_arc_top_m = adsk.core.Point3D.create(x_arc_end, 0.0, b2 / 2.0)
+    else:
+        # 宽轮：喉部圆弧延伸到 z_int 后过渡到外圆柱段 re2
+        dz_rim = (b2 / 2.0) - z_arc_end
+        c_eff = min(wheel_chamfer_c, dz_rim * 0.95, (b2 / 2.0) * 0.45) if dz_rim > 1e-4 else 0.0
+        has_chamfer = (c_eff > 1e-4)
+
+        p_arc_low_m = adsk.core.Point3D.create(re2, 0.0, -z_arc_end)
+        p_arc_mid_m = adsk.core.Point3D.create(da2 / 2.0, 0.0, 0.0)
+        p_arc_top_m = adsk.core.Point3D.create(re2, 0.0, z_arc_end)
+
+        if has_chamfer:
+            p_ch_rim_top_m = adsk.core.Point3D.create(re2, 0.0, (b2 / 2.0) - c_eff)
+            p_ch_face_top_m = adsk.core.Point3D.create(re2 - c_eff, 0.0, b2 / 2.0)
+            p_ch_face_low_m = adsk.core.Point3D.create(re2 - c_eff, 0.0, -b2 / 2.0)
+            p_ch_rim_low_m = adsk.core.Point3D.create(re2, 0.0, -(b2 / 2.0) + c_eff)
+        else:
+            p_rim_top_m = adsk.core.Point3D.create(re2, 0.0, b2 / 2.0)
+            p_rim_low_m = adsk.core.Point3D.create(re2, 0.0, -b2 / 2.0)
 
     # 转换至草图本地二维坐标空间
     s_arc_low = blank_sketch.modelToSketchSpace(p_arc_low_m)
@@ -376,45 +397,75 @@ def build_worm_wheel(
     throat_arc = arcs.addByThreePoints(s_arc_low, s_arc_mid, s_arc_top)
     curr_pt = throat_arc.endSketchPoint
 
-    if has_chamfer:
-        s_ch_rim_top = blank_sketch.modelToSketchSpace(p_chamfer_rim_top_m)
-        s_ch_face_top = blank_sketch.modelToSketchSpace(p_chamfer_face_top_m)
-        s_ch_face_low = blank_sketch.modelToSketchSpace(p_chamfer_face_low_m)
-        s_ch_rim_low = blank_sketch.modelToSketchSpace(p_chamfer_rim_low_m)
+    if is_narrow:
+        if has_chamfer:
+            s_ch_face_top = blank_sketch.modelToSketchSpace(p_ch_face_top_m)
+            s_ch_face_low = blank_sketch.modelToSketchSpace(p_ch_face_low_m)
 
-        # 1. 顶端斜面轮廓
-        if p_arc_top_m.distanceTo(p_chamfer_rim_top_m) > 1e-4:
-            l_rim = lines.addByTwoPoints(curr_pt, s_ch_rim_top)
-            curr_pt = l_rim.endSketchPoint
-        # 2. 顶端倒斜角 (Chamfer)
-        l_chamfer_top = lines.addByTwoPoints(curr_pt, s_ch_face_top)
-        curr_pt = l_chamfer_top.endSketchPoint
-        # 3. 顶端平端面
-        l_top = lines.addByTwoPoints(curr_pt, s_center_top)
-        # 4. 中心回转轴线
-        center_line = lines.addByTwoPoints(l_top.endSketchPoint, s_center_low)
-        curr_pt = center_line.endSketchPoint
-        # 5. 底端平端面
-        l_bot = lines.addByTwoPoints(curr_pt, s_ch_face_low)
-        curr_pt = l_bot.endSketchPoint
-        # 6. 底端倒斜角 (Chamfer)
-        l_chamfer_bot = lines.addByTwoPoints(curr_pt, s_ch_rim_low)
-        curr_pt = l_chamfer_bot.endSketchPoint
-        # 7. 底端斜面轮廓闭合回喉部圆弧
-        lines.addByTwoPoints(curr_pt, throat_arc.startSketchPoint)
+            # 1. 顶端倒斜角 (Chamfer)
+            l_chamfer_top = lines.addByTwoPoints(curr_pt, s_ch_face_top)
+            curr_pt = l_chamfer_top.endSketchPoint
+            # 2. 顶端平端面
+            l_top = lines.addByTwoPoints(curr_pt, s_center_top)
+            curr_pt = l_top.endSketchPoint
+            # 3. 中心回转轴线
+            center_line = lines.addByTwoPoints(l_top.endSketchPoint, s_center_low)
+            curr_pt = center_line.endSketchPoint
+            # 4. 底端平端面
+            l_bot = lines.addByTwoPoints(curr_pt, s_ch_face_low)
+            curr_pt = l_bot.endSketchPoint
+            # 5. 底端倒斜角 (Chamfer) 闭合回喉部圆弧
+            lines.addByTwoPoints(curr_pt, throat_arc.startSketchPoint)
+        else:
+            # 1. 顶端平端面
+            l_top = lines.addByTwoPoints(curr_pt, s_center_top)
+            curr_pt = l_top.endSketchPoint
+            # 2. 中心回转轴线
+            center_line = lines.addByTwoPoints(l_top.endSketchPoint, s_center_low)
+            curr_pt = center_line.endSketchPoint
+            # 3. 底端平端面闭合回喉部圆弧
+            lines.addByTwoPoints(curr_pt, throat_arc.startSketchPoint)
     else:
-        s_rim_top = blank_sketch.modelToSketchSpace(p_rim_top_m)
-        s_rim_low = blank_sketch.modelToSketchSpace(p_rim_low_m)
-        if p_arc_top_m.distanceTo(p_rim_top_m) > 1e-4:
-            l1 = lines.addByTwoPoints(curr_pt, s_rim_top)
-            curr_pt = l1.endSketchPoint
-        l2 = lines.addByTwoPoints(curr_pt, s_center_top)
-        center_line = lines.addByTwoPoints(l2.endSketchPoint, s_center_low)
-        curr_pt = center_line.endSketchPoint
-        if p_arc_low_m.distanceTo(p_rim_low_m) > 1e-4:
-            l4 = lines.addByTwoPoints(curr_pt, s_rim_low)
-            curr_pt = l4.endSketchPoint
-        lines.addByTwoPoints(curr_pt, throat_arc.startSketchPoint)
+        if has_chamfer:
+            s_ch_rim_top = blank_sketch.modelToSketchSpace(p_ch_rim_top_m)
+            s_ch_face_top = blank_sketch.modelToSketchSpace(p_ch_face_top_m)
+            s_ch_face_low = blank_sketch.modelToSketchSpace(p_ch_face_low_m)
+            s_ch_rim_low = blank_sketch.modelToSketchSpace(p_ch_rim_low_m)
+
+            # 1. 顶端外圆柱轮廓
+            if p_arc_top_m.distanceTo(p_ch_rim_top_m) > 1e-4:
+                l_rim = lines.addByTwoPoints(curr_pt, s_ch_rim_top)
+                curr_pt = l_rim.endSketchPoint
+            # 2. 顶端倒斜角 (Chamfer)
+            l_chamfer_top = lines.addByTwoPoints(curr_pt, s_ch_face_top)
+            curr_pt = l_chamfer_top.endSketchPoint
+            # 3. 顶端平端面
+            l_top = lines.addByTwoPoints(curr_pt, s_center_top)
+            curr_pt = l_top.endSketchPoint
+            # 4. 中心回转轴线
+            center_line = lines.addByTwoPoints(l_top.endSketchPoint, s_center_low)
+            curr_pt = center_line.endSketchPoint
+            # 5. 底端平端面
+            l_bot = lines.addByTwoPoints(curr_pt, s_ch_face_low)
+            curr_pt = l_bot.endSketchPoint
+            # 6. 底端倒斜角 (Chamfer)
+            l_chamfer_bot = lines.addByTwoPoints(curr_pt, s_ch_rim_low)
+            curr_pt = l_chamfer_bot.endSketchPoint
+            # 7. 底端外圆柱段闭合回喉部圆弧
+            lines.addByTwoPoints(curr_pt, throat_arc.startSketchPoint)
+        else:
+            s_rim_top = blank_sketch.modelToSketchSpace(p_rim_top_m)
+            s_rim_low = blank_sketch.modelToSketchSpace(p_rim_low_m)
+            if p_arc_top_m.distanceTo(p_rim_top_m) > 1e-4:
+                l1 = lines.addByTwoPoints(curr_pt, s_rim_top)
+                curr_pt = l1.endSketchPoint
+            l2 = lines.addByTwoPoints(curr_pt, s_center_top)
+            center_line = lines.addByTwoPoints(l2.endSketchPoint, s_center_low)
+            curr_pt = center_line.endSketchPoint
+            if p_arc_low_m.distanceTo(p_rim_low_m) > 1e-4:
+                l4 = lines.addByTwoPoints(curr_pt, s_rim_low)
+                curr_pt = l4.endSketchPoint
+            lines.addByTwoPoints(curr_pt, throat_arc.startSketchPoint)
 
     if blank_sketch.profiles.count == 0:
         raise RuntimeError("蜗轮轮坯草图未形成闭合轮廓")
@@ -461,12 +512,37 @@ def build_worm_wheel(
     if len(sections_data) < 3:
         raise RuntimeError("计算单齿槽共轭截面失败，未能获取足够的有效截面")
 
-    # 在临时子组件中进行截面草图与放样创建，保持主时间线绝对干净
-    temp_occ = component.occurrences.addNewComponent(adsk.core.Matrix3D.create())
+    # 在临时子组件中进行截面草图与放样创建，保持主时间线干净。
+    #
+    # 但「零件设计」文档不允许新建零部件（addNewComponent 会抛
+    # "零件设计文档只能包含一个零部件"），此时回退为直接在当前组件内放样，
+    # 用完立刻删除放样体与草图，效果相同。
     temp_mgr = adsk.fusion.TemporaryBRepManager.get()
     slot_ref = None
+
+    temp_occ = None
+    temp_comp = component
+    owns_temp = False
     try:
+        temp_occ = component.occurrences.addNewComponent(adsk.core.Matrix3D.create())
         temp_comp = temp_occ.component
+        owns_temp = True
+    except Exception:
+        # 零件设计文档：直接用当前组件放样
+        temp_occ = None
+        temp_comp = component
+        owns_temp = False
+
+    # 回退路径下需要自行清理放样产生的实体（正常路径随临时组件一并删除）
+    bodies_before = set()
+    if not owns_temp:
+        try:
+            for b in component.bRepBodies:
+                bodies_before.add(b.entityToken)
+        except Exception:
+            bodies_before = None
+
+    try:
         temp_planes = temp_comp.constructionPlanes
         temp_sketches = temp_comp.sketches
         loft_feats = temp_comp.features.loftFeatures
@@ -558,10 +634,37 @@ def build_worm_wheel(
         slot_body = loft_feat.bodies.item(0)
         slot_ref = temp_mgr.copy(slot_body)
     finally:
-        try:
-            temp_occ.deleteMe()
-        except Exception:
-            pass
+        if owns_temp and temp_occ is not None:
+            # 正常路径：删除整个临时组件，草图和放样体一并消失
+            try:
+                temp_occ.deleteMe()
+            except Exception:
+                pass
+        else:
+            # 回退路径：临时组件就是目标组件本身，只清理放样产生的实体
+            try:
+                remove_feats_local = component.features.removeFeatures
+                for b in list(component.bRepBodies):
+                    if bodies_before is None:
+                        continue
+                    try:
+                        if b.entityToken not in bodies_before:
+                            remove_feats_local.add(b)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # 隐藏回退路径下产生的草图与构造基准面
+            for sk in component.sketches:
+                try:
+                    sk.isLightBulbOn = False
+                except Exception:
+                    pass
+            for pl in component.constructionPlanes:
+                try:
+                    pl.isLightBulbOn = False
+                except Exception:
+                    pass
 
     if slot_ref is None or slot_ref.volume <= 1e-5:
         raise RuntimeError("单齿槽实体放样未能生成有效三维几何体")
